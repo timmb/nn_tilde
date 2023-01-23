@@ -1,19 +1,18 @@
 #include "backend.h"
 #include "parsing_utils.h"
+#include "logger.h"
 #include <algorithm>
 #include <iostream>
 #include <stdlib.h>
 
-#define CUDA torch::kCUDA
 #define CPU torch::kCPU
+#define CUDA torch::kCUDA
+#define MPS torch::kMPS
 
-Backend::Backend()
-    : m_loaded(0), m_cuda_available(torch::cuda::is_available()) {
+Backend::Backend(Logger *logger): m_loaded(0), m_cuda_available(torch::cuda::is_available()) {
+  // Check device
   at::init_num_threads();
-  if (m_cuda_available)
-    std::cout << "using cuda" << std::endl;
-  else
-    std::cout << "using cpu" << std::endl;
+  this->logger = logger;
 }
 
 void Backend::perform(std::vector<float *> in_buffer,
@@ -41,9 +40,10 @@ void Backend::perform(std::vector<float *> in_buffer,
   auto cat_tensor_in = torch::cat(tensor_in, 1);
   cat_tensor_in = cat_tensor_in.reshape({n_batches, in_dim, -1, in_ratio});
   cat_tensor_in = cat_tensor_in.select(-1, -1);
-
-  if (m_cuda_available)
+  if (this->device == "cuda")
     cat_tensor_in = cat_tensor_in.to(CUDA);
+  if (this->device == "mps")
+    cat_tensor_in = cat_tensor_in.to(MPS);
 
   std::vector<torch::jit::IValue> inputs = {cat_tensor_in};
 
@@ -54,6 +54,7 @@ void Backend::perform(std::vector<float *> in_buffer,
     tensor_out = tensor_out.repeat_interleave(out_ratio).reshape(
         {n_batches, out_dim, -1});
   } catch (const std::exception &e) {
+    logger->error(e.what());
     std::cerr << e.what() << '\n';
     return;
   }
@@ -62,12 +63,13 @@ void Backend::perform(std::vector<float *> in_buffer,
 
   // CHECKS ON TENSOR SHAPE
   if (out_batches * out_channels != out_buffer.size()) {
-    std::cout << "bad out_buffer size, expected " << out_batches * out_channels
-              << " buffers, got " << out_buffer.size() << "!\n";
+    logger->error("bad out_buffer size, expected " + std::to_string(out_batches * out_channels) + 
+              " buffers, got " + std::to_string(out_buffer.size()));
     return;
   }
 
   if (out_n_vec != n_vec) {
+    logger->error("model output size is not consistent, expected " + std::to_string(n_vec) + " samples, got " + std::to_string(out_n_vec));
     std::cout << "model output size is not consistent, expected " << n_vec
               << " samples, got " << out_n_vec << "!\n";
     return;
@@ -83,18 +85,44 @@ void Backend::perform(std::vector<float *> in_buffer,
 }
 
 int Backend::load(std::string path) {
+  logger->post("loading model " + path + "...");
   try {
     m_model = torch::jit::load(path);
+    model_path = path;
     m_model.eval();
-    if (m_cuda_available) {
-      std::cout << "sending model to gpu" << std::endl;
-      m_model.to(CUDA);
-    }
+
     m_loaded = 1;
     return 0;
   } catch (const std::exception &e) {
+    logger->error(e.what());
     std::cerr << e.what() << '\n';
     return 1;
+  }
+}
+
+void Backend::reload() {
+  load(model_path);
+}
+
+void Backend::set_device(std::string device) {
+  if (device=="cuda") {
+    if (!torch::cuda::is_available()) {
+      logger->warning("CUDA not available. Set device to CPU.");
+      this->device = "cpu";
+    } else {
+      this->device = "cuda";
+    }
+    if (m_loaded)
+      m_model.to(CUDA);
+  } else if (device=="mps") {
+    // check if MPS is available?
+    this->device = device;
+    if (m_loaded)
+      m_model.to(MPS);
+  } else if (device == "cpu") {
+    this->device = device;
+    if (m_loaded)
+      m_model.to(CPU);
   }
 }
 
@@ -170,6 +198,7 @@ std::vector<c10::IValue> Backend::get_attribute(std::string attribute_name) {
   try {
     auto attribute_getter = m_model.get_method(attribute_getter_name);
   } catch (...) {
+    logger->error("getter for attribute " + attribute_name + " not found in model");
     throw "getter for attribute " + attribute_name + " not found in model";
   }
   std::vector<c10::IValue> getter_inputs = {}, attributes;
@@ -193,6 +222,7 @@ std::string Backend::get_attribute_as_string(std::string attribute_name) {
   try {
     setter_params = m_model.attr(attribute_name + "_params").toTensor();
   } catch (...) {
+    logger->error("parameters to set attribute " + attribute_name + " not found in model");
     throw "parameters to set attribute " + attribute_name + " not found in model";
   } 
   std::string current_attr = "";
@@ -221,6 +251,7 @@ std::string Backend::get_attribute_as_string(std::string attribute_name) {
         break;
       }
       default: {
+        logger->error("bad type id : " + std::to_string(current_id) + "at index " + std::to_string(i));
         throw "bad type id : " + std::to_string(current_id) + "at index " + std::to_string(i);
         break;
       }
@@ -238,6 +269,7 @@ void Backend::set_attribute(std::string attribute_name, std::vector<std::string>
   try {
     auto attribute_setter = m_model.get_method(attribute_setter_name);
   } catch (...) {
+    logger->error("setter for attribute " + attribute_name + " not found in model");
     throw "setter for attribute " + attribute_name + " not found in model";
   }
   // find arguments
@@ -245,6 +277,7 @@ void Backend::set_attribute(std::string attribute_name, std::vector<std::string>
   try {
     setter_params = m_model.attr(attribute_name + "_params").toTensor();
   } catch (...) {
+    logger->error("parameters to set attribute " + attribute_name + " not found in model");
     throw "parameters to set attribute " + attribute_name + " not found in model";
   }
   // process inputs
@@ -269,6 +302,7 @@ void Backend::set_attribute(std::string attribute_name, std::vector<std::string>
       setter_inputs.push_back(c10::IValue(attribute_args[i]));
       break;
       default:
+      logger->error("bad type id : " + std::to_string(current_id) + "at index " + std::to_string(i));
       throw "bad type id : " + std::to_string(current_id) + "at index " + std::to_string(i);
       break;
     }
@@ -277,9 +311,11 @@ void Backend::set_attribute(std::string attribute_name, std::vector<std::string>
     auto setter_out = m_model.get_method(attribute_setter_name)(setter_inputs);
     int setter_result = setter_out.toInt();
     if (setter_result != 0) {
+      logger->error("setter failed");
       throw "setter returned -1";
     }
   } catch (...) {
+    logger->error("setter for " + attribute_name + " failed");
     throw "setter for " + attribute_name + " failed";
   }
 }
